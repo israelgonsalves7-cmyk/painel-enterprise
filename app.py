@@ -31,11 +31,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# MÓDULOS DE MACHINE LEARNING E PREVISÃO
+# MÓDULOS DE MACHINE LEARNING E PREVISÃO SEGURA
 # ==========================================
 def run_clustering(df, n_clusters=3):
     numeric_df = df.select_dtypes(include=np.number).dropna()
-    if len(numeric_df) < n_clusters:
+    if len(numeric_df) < n_clusters or numeric_df.empty:
         return df, None
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(numeric_df)
@@ -48,14 +48,15 @@ def run_clustering(df, n_clusters=3):
 def run_forecast(df, date_col, value_col, periods=12):
     try:
         temp_df = df[[date_col, value_col]].dropna().copy()
-        temp_df[date_col] = pd.to_datetime(temp_df[date_col])
+        temp_df[date_col] = pd.to_datetime(temp_df[date_col], errors='coerce')
+        temp_df = temp_df.dropna(subset=[date_col])
         temp_df = temp_df.sort_values(by=date_col).set_index(date_col)
-        temp_df = temp_df.resample('ME').sum()
+        temp_df = temp_df.resample('ME').sum(numeric_only=True)
         
-        if len(temp_df) < 6:
+        if len(temp_df) < 4:
             return None
             
-        model = ExponentialSmoothing(temp_df[value_col], trend='add', seasonal=None).fit()
+        model = ExponentialSmoothing(temp_df[value_col], trend='add', seasonal=None, initialization_method='estimated').fit()
         forecast = model.forecast(periods)
         forecast_dates = pd.date_range(start=temp_df.index[-1] + pd.offsets.MonthEnd(1), periods=periods, freq='ME')
         
@@ -76,21 +77,26 @@ with st.sidebar:
     df = None
     
     if source_type == "Google Sheets (Live/Auto-Sync)":
-        st.markdown("Insira o link público ou configure as credenciais via secrets para atualização em tempo real.")
+        st.markdown("Insira o link público da planilha (Google Sheets).")
         gsheet_url = st.text_input("URL da Planilha Google Sheets")
         
         if gsheet_url:
             try:
-                @st.cache_data(ttl=10) # Atualização e cache otimizado a cada 10 segundos
-                化物 = gsheet_url.replace("/edit?usp=sharing", "/export?format=csv").replace("/edit#gid=0", "/export?format=csv")
-                df = pd.read_csv(化物)
+                # Tratamento robusto para links públicos do Google Sheets exportados como CSV
+                if "edit" in gsheet_url:
+                    base_url = gsheet_url.split('/edit')[0]
+                    csv_url = f"{base_url}/export?format=csv"
+                else:
+                    csv_url = gsheet_url
+                
+                @st.cache_data(ttl=10)
+                def load_gsheet(url):
+                    return pd.read_csv(url)
+                
+                df = load_gsheet(csv_url)
                 st.success("✅ Sincronizado com Google Sheets com sucesso!")
             except Exception as e:
-                try:
-                    df = pd.read_csv(gsheet_url)
-                    st.success("✅ Sincronizado com sucesso!")
-                except Exception as err:
-                    st.error(f"Erro ao conectar na planilha. Verifique se o link está público para leitura. Detalhes: {err}")
+                st.error(f"Erro ao conectar na planilha. Verifique se o link está público para leitura ('Qualquer pessoa com o link'). Detalhes: {e}")
     else:
         uploaded_file = st.file_uploader("Carregar Base de Dados Local", type=["csv", "xlsx", "parquet"])
         if uploaded_file is not None:
@@ -111,8 +117,11 @@ with st.sidebar:
     clusters_count = st.slider("Segmentos de Cluster", 2, 6, 3) if enable_ml else 3
 
 if df is None:
-    st.info("👋 **Ambiente Global Pronto.** Conecte uma planilha do Google Sheets (com atualização automática em tempo real) ou faça o upload de um arquivo para iniciar a automação corporativa.")
+    st.info("👋 **Ambiente Global Pronto.** Conecte uma planilha do Google Sheets (com atualização automática em tempo real) ou faça o upload de um arquivo na barra lateral para iniciar a automação corporativa.")
     st.stop()
+
+# Tratamento prévio de segurança contra colunas duplicadas ou nomes vazios
+df.columns = [str(col).strip() for col in df.columns]
 
 if enable_ml:
     df = run_clustering(df, n_clusters=clusters_count)
@@ -152,14 +161,14 @@ with tab_visao:
         if cat_cols and numeric_cols:
             dim_sel = st.selectbox("Dimensão Regional/Global", cat_cols, key="dim_v1")
             met_sel = st.selectbox("Métrica de Desempenho", numeric_cols, key="met_v1")
-            agg_df = df.groupby(dim_sel)[met_sel].sum().reset_index().sort_values(by=met_sel, ascending=False).head(10)
+            agg_df = df.groupby(dim_sel, dropna=False)[met_sel].sum().reset_index().sort_values(by=met_sel, ascending=False).head(10)
             
             fig = px.bar(agg_df, x=dim_sel, y=met_sel, title=f"Top 10 {dim_sel} por {met_sel}",
                          template="plotly_white", color=met_sel, color_continuous_scale="Viridis")
             fig.update_layout(xaxis_title=dim_sel, yaxis_title=f"{met_sel} ({currency_symbol})", showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("A base de dados requer colunas categóricas e numétricas combinadas.")
+            st.warning("A base de dados requer colunas categóricas e numéricas combinadas.")
             
     with col_v2:
         if len(numeric_cols) >= 2:
@@ -211,11 +220,12 @@ with tab_pred:
         p_horizon = st.slider("Horizonte de Previsão (Meses)", 1, 24, 6)
         
         if st.button("Processar Projeção Estatística"):
-            with st.spinner("Executando modelos de suavização exponencial..."):
+            with st.spinner("Executando modelos preditivos..."):
                 forecast_res = run_forecast(df, p_date, p_val, periods=p_horizon)
                 if forecast_res is not None:
                     fig_f = go.Figure()
-                    temp_orig = df.groupby(pd.to_datetime(df[p_date]))[p_val].sum().reset_index()
+                    temp_orig = df.groupby(pd.to_datetime(df[p_date], errors='coerce'))[p_val].sum().reset_index()
+                    temp_orig = temp_orig.dropna()
                     
                     fig_f.add_trace(go.Scatter(x=temp_orig[p_date], y=temp_orig[p_val], name="Histórico Real", mode='lines+markers', line=dict(color='#0f172a')))
                     fig_f.add_trace(go.Scatter(x=forecast_res['Data'], y=forecast_res['Projecao'], name="Projeção Futura", mode='lines+markers', line=dict(color='#2563eb', dash='dash')))
@@ -224,7 +234,7 @@ with tab_pred:
                     st.plotly_chart(fig_f, use_container_width=True)
                     st.dataframe(forecast_res, use_container_width=True)
                 else:
-                    st.error("Histórico insuficiente (mínimo de 6 períodos temporais necessários).")
+                    st.error("Histórico insuficiente ou formato de data inválido (mínimo de 4 períodos temporais necessários).")
     else:
         st.info("Certifique-se de que a base possui uma coluna de data e colunas numéricas.")
 
